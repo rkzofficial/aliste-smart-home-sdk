@@ -1,0 +1,6 @@
+baseUrl = "https://web.alistetechnologies.com"
+baseUrl2 = "https://a3.alistetechnologies.com"
+wssUrl = "https://a2.alistetechnologies.com/?"
+loginUrl = "https://web.alistetechnologies.com/v2/auth/login"
+homeDetailsUrl = "https://a3.alistetechnologies.com/api/fetch/house2"
+commandUrl = "https://a3.alistetechnologies.com/api/sendCommand"
