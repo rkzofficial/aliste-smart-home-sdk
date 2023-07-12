@@ -1,5 +1,5 @@
-from .enums import DeviceType
 from .broker import AlisteBroker
+from .enums import DeviceType
 
 
 class Device:
@@ -25,6 +25,7 @@ class Device:
         self.roomName = roomName
         self.broker = broker
 
+        self._callbacks = set()
         self.broker.register_callback(self.on_message)
 
     def on_message(self, message):
@@ -34,10 +35,23 @@ class Device:
         ):
             self.on_state_change(message["state"])
 
+    def refresh(self):
+        for callback in self._callbacks:
+            callback()
+
+    def register_callback(self, callback) -> None:
+        """Register callback, called when Roller changes state."""
+        self._callbacks.add(callback)
+
+    def remove_callback(self, callback) -> None:
+        """Remove previously registered callback."""
+        self._callbacks.discard(callback)
+
     def on_state_change(self, state):
         self.switchState = float(state)
+        self.refresh()
 
-    def build_command(self, command: int):
+    def build_command(self, command: float):
         return {
             "deviceId": self.deviceId,
             "switchId": self.switchId,
@@ -50,5 +64,5 @@ class Device:
     async def turn_off(self):
         await self.broker.send_command(self.build_command(0))
 
-    async def dim(self, value: int):
+    async def dim(self, value: float):
         await self.broker.send_command(self.build_command(value))

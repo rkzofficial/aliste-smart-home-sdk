@@ -20,7 +20,6 @@ class AlisteHub:
 
     async def __aexit__(self, *excinfo):
         await self.http.close()
-        await self.broker.disconnect()
 
     async def init(self, username: str, password: str):
         await self.authenticate(username, password)

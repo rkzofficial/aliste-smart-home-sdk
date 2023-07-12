@@ -19,6 +19,12 @@ class AlisteBroker:
 
         self.callbacks = []
 
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *excinfo):
+        await self.disconnect()
+
     async def connect(self, homeId, mobile):
         params = {
             "node_mcu_id": "auto1001",
@@ -32,6 +38,7 @@ class AlisteBroker:
 
     async def disconnect(self):
         await self.sio.disconnect()
+        await self.http.close()
 
     def register_callback(self, callback):
         self.callbacks.append(callback)
