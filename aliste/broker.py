@@ -52,9 +52,9 @@ class AlisteBroker:
         return self.sio.connected
 
     async def send_command(self, command: int):
-        if self.is_connected:
-            await self.sio.emit("message", command)
-        else:
-            await self.http.post(constants.commandUrl, json=command)
-            command.state = command.command
-            self.message(command)
+        # if self.is_connected:
+        #     await self.sio.emit("message", command)
+        # else:
+        await self.http.post(constants.commandUrl, json=command)
+        command["state"] = command["command"]
+        self.message(command)
