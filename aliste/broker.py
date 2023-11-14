@@ -34,7 +34,7 @@ class AlisteBroker:
         }
 
         url = constants.wssUrl + urllib.parse.urlencode(params)
-        await self.sio.connect(url=url, transports=["websocket"])
+        # await self.sio.connect(url=url, transports=["websocket"])
 
     async def disconnect(self):
         await self.sio.disconnect()

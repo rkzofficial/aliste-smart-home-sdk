@@ -4,7 +4,7 @@ from setuptools import setup
 # This call to setup() does all the work
 setup(
     name="aliste",
-    version="0.1.8",
+    version="0.1.9",
     description="Aliste Smart Home SDK for Python",
     long_description="Aliste Smart Home SDK for Python",
     long_description_content_type="text/markdown",
