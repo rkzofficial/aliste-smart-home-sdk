@@ -1,4 +1,6 @@
 import aiohttp
+import asyncio
+import json
 
 from .utils import *
 from . import constants
@@ -13,6 +15,7 @@ class AlisteHub:
 
     def __init__(self):
         self.http = aiohttp.ClientSession()
+        self.background_tasks = set()
         self.broker = AlisteBroker()
 
     async def __aenter__(self):
@@ -20,13 +23,63 @@ class AlisteHub:
 
     async def __aexit__(self, *excinfo):
         await self.http.close()
+        await self.broker.disconnect()
 
     async def init(self, username: str, password: str):
-        await self.authenticate(username, password)
+        await self._authenticate(username, password)
         await self.get_home_details()
-        await self.broker.connect(self.user.homeId, self.user.mobile)
+        await self._init_broker()
 
-    async def authenticate(self, mobile: str, password: str):
+    async def _init_broker(self):
+        topics_set = set()
+
+        for device in self.home.devices:
+            topics_set.add(f"message/{device.deviceId}")
+
+        self.broker.set_topics(list(topics_set))
+        loop = asyncio.get_event_loop()
+        # Listen for mqtt messages in an (unawaited) asyncio task
+        task = loop.create_task(
+            self.broker.connect(self.user.credentials, self.get_credentials)
+        )
+        # Save a reference to the task so it doesn't get garbage collected
+        self.background_tasks.add(task)
+        task.add_done_callback(self.background_tasks.remove)
+
+    async def get_credentials(self):
+        try:
+            await self._authenticate_cognito()
+        except:
+            print("Failed to fetch credentials")
+        return self.user.credentials
+
+    async def _authenticate_cognito(self):
+        payload = {"IdentityId": constants.identityId}
+
+        headers = {
+            "x-amz-target": "AWSCognitoIdentityService.GetCredentialsForIdentity",
+            "cache-control": "no-store",
+            "x-amz-user-agent": "aws-amplify/5.3.8 framework/201",
+            "host": "cognito-identity.ap-south-1.amazonaws.com",
+            "connection": "Keep-Alive",
+            "user-agent": "okhttp/4.9.2",
+            "content-type": "application/x-amz-json-1.1",
+        }
+
+        response = await self.http.post(
+            constants.cognitoUrl, data=json.dumps(payload), headers=headers
+        )
+
+        if response.status != 200:
+            raise Exception("Authentication failed")
+
+        data = await response.json(content_type=None)
+        credentials = data["Credentials"]
+        return credentials
+
+    async def _authenticate(self, mobile: str, password: str):
+        credentials = await self._authenticate_cognito()
+
         payload = {
             "mobile": mobile,
             "password": password,
@@ -43,7 +96,10 @@ class AlisteHub:
                 name=data["profile"]["name"],
                 homeId=data["profile"]["selectedHouse"],
                 mobile=data["profile"]["mobile"],
+                credentials=credentials,
             )
+            self.username = mobile
+            self.password = password
         else:
             raise Exception("Authentication failed")
 
