@@ -2,7 +2,7 @@ import aiohttp
 import asyncio
 import json
 
-from .utils import parse_device_type
+from .utils import *
 from . import constants
 from .user import User
 from .device import Device
