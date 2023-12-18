@@ -2,7 +2,7 @@ import aiohttp
 import asyncio
 import json
 
-from .utils import *
+from .utils import parse_device_type
 from . import constants
 from .user import User
 from .device import Device
@@ -39,9 +39,7 @@ class AlisteHub:
         self.broker.set_topics(list(topics_set))
         loop = asyncio.get_event_loop()
         # Listen for mqtt messages in an (unawaited) asyncio task
-        task = loop.create_task(
-            self.broker.connect(self.user.credentials, self.get_credentials)
-        )
+        task = loop.create_task(self.broker.connect(self.get_credentials))
         # Save a reference to the task so it doesn't get garbage collected
         self.background_tasks.add(task)
         task.add_done_callback(self.background_tasks.remove)
@@ -49,7 +47,7 @@ class AlisteHub:
     async def get_credentials(self):
         try:
             await self._authenticate_cognito()
-        except:
+        except:  # noqa: E722
             print("Failed to fetch credentials")
         return self.user.credentials
 

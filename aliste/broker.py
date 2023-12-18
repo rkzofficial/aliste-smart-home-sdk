@@ -29,35 +29,34 @@ class AlisteBroker:
     async def __aexit__(self, *excinfo):
         await self.disconnect()
 
-    async def connect(self, tCredentials, get_credentials):
-        credentials = tCredentials
-
-        ws_url = aws_signv4_mqtt.generate_signv4_mqtt(
-            f"{constants.iotId}.iot.{constants.region}.amazonaws.com",
-            constants.region,
-            credentials["AccessKeyId"],
-            credentials["SecretKey"],
-            session_token=credentials["SessionToken"],
-        )
-
-        urlparts = urlparse(ws_url)
-
-        # Host header needs to be set, port is not included in signed host header so should not be included here.
-        # No idea what it defaults to but whatever that it seems to be wrong.
-        headers = {
-            "Host": "{0:s}".format(urlparts.netloc),
-        }
-
-        self.client = Client(
-            hostname=urlparts.netloc,
-            port=443,
-            transport="websockets",
-            websocket_path="{}?{}".format(urlparts.path, urlparts.query),
-            websocket_headers=headers,
-            tls_context=ssl.create_default_context(cafile=certifi.where()),
-        )
-
+    async def connect(self, get_credentials):
         while True:
+            credentials = await get_credentials()
+
+            ws_url = aws_signv4_mqtt.generate_signv4_mqtt(
+                f"{constants.iotId}.iot.{constants.region}.amazonaws.com",
+                constants.region,
+                credentials["AccessKeyId"],
+                credentials["SecretKey"],
+                session_token=credentials["SessionToken"],
+            )
+
+            urlparts = urlparse(ws_url)
+
+            # Host header needs to be set, port is not included in signed host header so should not be included here.
+            # No idea what it defaults to but whatever that it seems to be wrong.
+            headers = {
+                "Host": "{0:s}".format(urlparts.netloc),
+            }
+
+            self.client = Client(
+                hostname=urlparts.netloc,
+                port=443,
+                transport="websockets",
+                websocket_path="{}?{}".format(urlparts.path, urlparts.query),
+                websocket_headers=headers,
+                tls_context=ssl.create_default_context(cafile=certifi.where()),
+            )
             try:
                 async with self.client:
                     async with self.client.messages() as messages:
@@ -72,7 +71,7 @@ class AlisteBroker:
                 print(
                     f'Error "{error}". Reconnecting in {self.reconnect_interval} seconds.'
                 )
-                credentials = await get_credentials()
+
                 await asyncio.sleep(self.reconnect_interval)
 
     async def disconnect(self):
