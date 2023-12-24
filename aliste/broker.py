@@ -19,15 +19,7 @@ class AlisteBroker:
     connected = False
 
     def __init__(self):
-        self.http = ClientSession()
-
         self.callbacks = []
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *excinfo):
-        await self.disconnect()
 
     async def connect(self, get_credentials):
         while True:
@@ -49,17 +41,17 @@ class AlisteBroker:
                 "Host": "{0:s}".format(urlparts.netloc),
             }
 
-            self.client = Client(
-                hostname=urlparts.netloc,
-                port=443,
-                transport="websockets",
-                websocket_path="{}?{}".format(urlparts.path, urlparts.query),
-                websocket_headers=headers,
-                tls_context=ssl.create_default_context(cafile=certifi.where()),
-            )
             try:
-                async with self.client:
-                    async with self.client.messages() as messages:
+                async with Client(
+                    hostname=urlparts.netloc,
+                    port=443,
+                    transport="websockets",
+                    websocket_path="{}?{}".format(urlparts.path, urlparts.query),
+                    websocket_headers=headers,
+                    tls_context=ssl.create_default_context(cafile=certifi.where()),
+                ) as client:
+                    self.client = client
+                    async with client.messages() as messages:
                         await self.on_connect()
 
                         async for message in messages:
@@ -73,9 +65,6 @@ class AlisteBroker:
                 )
 
                 await asyncio.sleep(self.reconnect_interval)
-
-    async def disconnect(self):
-        await self.http.close()
 
     def register_callback(self, callback):
         self.callbacks.append(callback)
@@ -118,6 +107,7 @@ class AlisteBroker:
                 f"control/{deviceId}", f"{switchId},{command * 100}"
             )
         else:
-            await self.http.post(constants.commandUrl, json=payload)
-            payload["state"] = payload["command"]
-            self.message(payload)
+            async with ClientSession() as session:
+                async with session.post(constants.commandUrl, json=payload):
+                    payload["state"] = payload["command"]
+                    self.message(payload)

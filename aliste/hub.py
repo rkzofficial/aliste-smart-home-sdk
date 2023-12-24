@@ -1,7 +1,7 @@
-import aiohttp
 import asyncio
 import json
 
+from aiohttp import ClientSession
 from .utils import *
 from . import constants
 from .user import User
@@ -14,16 +14,8 @@ class AlisteHub:
     home: Home
 
     def __init__(self):
-        self.http = aiohttp.ClientSession()
         self.background_tasks = set()
         self.broker = AlisteBroker()
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *excinfo):
-        await self.http.close()
-        await self.broker.disconnect()
 
     async def init(self, username: str, password: str):
         await self._authenticate(username, password)
@@ -64,16 +56,16 @@ class AlisteHub:
             "content-type": "application/x-amz-json-1.1",
         }
 
-        response = await self.http.post(
-            constants.cognitoUrl, data=json.dumps(payload), headers=headers
-        )
+        async with ClientSession() as session:
+            async with session.post(
+                constants.cognitoUrl, data=json.dumps(payload), headers=headers
+            ) as response:
+                if response.status != 200:
+                    raise Exception("Authentication failed")
 
-        if response.status != 200:
-            raise Exception("Authentication failed")
-
-        data = await response.json(content_type=None)
-        credentials = data["Credentials"]
-        return credentials
+                data = await response.json(content_type=None)
+                credentials = data["Credentials"]
+                return credentials
 
     async def _authenticate(self, mobile: str, password: str):
         credentials = await self._authenticate_cognito()
@@ -83,23 +75,23 @@ class AlisteHub:
             "password": password,
         }
 
-        response = await self.http.post(constants.loginUrl, json=payload)
-
-        if response.status == 200:
-            json = await response.json()
-            data = json["data"]
-            self.user = User(
-                accesstoken=data["accesstoken"],
-                email=data["profile"]["email"],
-                name=data["profile"]["name"],
-                homeId=data["profile"]["selectedHouse"],
-                mobile=data["profile"]["mobile"],
-                credentials=credentials,
-            )
-            self.username = mobile
-            self.password = password
-        else:
-            raise Exception("Authentication failed")
+        async with ClientSession() as session:
+            async with session.post(constants.loginUrl, json=payload) as response:
+                if response.status == 200:
+                    json = await response.json()
+                    data = json["data"]
+                    self.user = User(
+                        accesstoken=data["accesstoken"],
+                        email=data["profile"]["email"],
+                        name=data["profile"]["name"],
+                        homeId=data["profile"]["selectedHouse"],
+                        mobile=data["profile"]["mobile"],
+                        credentials=credentials,
+                    )
+                    self.username = mobile
+                    self.password = password
+                else:
+                    raise Exception("Authentication failed")
 
     # Get home details
     async def get_home_details(self):
