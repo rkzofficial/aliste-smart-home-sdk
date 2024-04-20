@@ -2,7 +2,7 @@ import asyncio
 import json
 
 from aiohttp import ClientSession
-from .utils import *
+from .utils import parse_device_type
 from . import constants
 from .user import User
 from .device import Device
@@ -16,6 +16,13 @@ class AlisteHub:
     def __init__(self):
         self.background_tasks = set()
         self.broker = AlisteBroker()
+        self.http = ClientSession()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *excinfo):
+        await self.http.close()
 
     async def init(self, username: str, password: str):
         await self._authenticate(username, password)

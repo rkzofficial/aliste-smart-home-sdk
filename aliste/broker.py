@@ -23,25 +23,24 @@ class AlisteBroker:
 
     async def connect(self, get_credentials):
         while True:
-            credentials = await get_credentials()
-
-            ws_url = aws_signv4_mqtt.generate_signv4_mqtt(
-                f"{constants.iotId}.iot.{constants.region}.amazonaws.com",
-                constants.region,
-                credentials["AccessKeyId"],
-                credentials["SecretKey"],
-                session_token=credentials["SessionToken"],
-            )
-
-            urlparts = urlparse(ws_url)
-
-            # Host header needs to be set, port is not included in signed host header so should not be included here.
-            # No idea what it defaults to but whatever that it seems to be wrong.
-            headers = {
-                "Host": "{0:s}".format(urlparts.netloc),
-            }
-
             try:
+                credentials = await get_credentials()
+
+                ws_url = aws_signv4_mqtt.generate_signv4_mqtt(
+                    f"{constants.iotId}.iot.{constants.region}.amazonaws.com",
+                    constants.region,
+                    credentials["AccessKeyId"],
+                    credentials["SecretKey"],
+                    session_token=credentials["SessionToken"],
+                )
+
+                urlparts = urlparse(ws_url)
+
+                # Host header needs to be set, port is not included in signed host header so should not be included here.
+                # No idea what it defaults to but whatever that it seems to be wrong.
+                headers = {
+                    "Host": "{0:s}".format(urlparts.netloc),
+                }
                 async with Client(
                     hostname=urlparts.netloc,
                     port=443,
@@ -51,11 +50,10 @@ class AlisteBroker:
                     tls_context=ssl.create_default_context(cafile=certifi.where()),
                 ) as client:
                     self.client = client
-                    async with client.messages() as messages:
-                        await self.on_connect()
+                    await self.on_connect()
 
-                        async for message in messages:
-                            self.on_message(message)
+                    async for message in client.messages:
+                        self.on_message(message)
 
             except MqttError as error:
                 self.connected = False
