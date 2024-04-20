@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "aliste"
-version = "1.0.1"
+version = "1.0.2"
 description = "Aliste Smart Home SDK for Python"
 authors = ["Raj Kishore <40551183+rkzofficial@users.noreply.github.com>"]
 license = "MIT"
