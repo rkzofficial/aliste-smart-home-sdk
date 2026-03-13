@@ -1,10 +1,11 @@
+from __future__ import annotations
+
 from .enums import DeviceType
 
 
-def parse_device_type(type: int):
-    if type == 6 or type == 2:
+def parse_device_type(device_type: int) -> DeviceType:
+    if device_type in {2, 6}:
         return DeviceType.LIGHT
-    if type == 0:
+    if device_type == 0:
         return DeviceType.FAN
-    else:
-        return DeviceType.SWITCH
+    return DeviceType.SWITCH

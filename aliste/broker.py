@@ -1,28 +1,61 @@
+from __future__ import annotations
+
 import asyncio
-import ssl
 import json
-import certifi
-import aws_signv4_mqtt
+import logging
+import ssl
+from collections.abc import Awaitable, Callable
+from typing import TypedDict
 from urllib.parse import urlparse
+
+import aws_signv4_mqtt  # type: ignore[import-untyped]
+import certifi
 from aiohttp import ClientSession
 from aiomqtt import Client, Message, MqttError
 
 from . import constants
+from .errors import ApiError
+
+logger = logging.getLogger(__name__)
+
+CredentialProvider = Callable[[], Awaitable[dict[str, str]]]
+MessageCallback = Callable[["BrokerMessage"], None]
 
 
-def isAsync(someFunc):
-    return asyncio.iscoroutinefunction(someFunc)
+class BrokerMessage(TypedDict):
+    deviceId: str
+    switchId: int
+    state: float
+
+
+class CommandPayload(TypedDict):
+    deviceId: str
+    switchId: int
+    command: float
 
 
 class AlisteBroker:
-    reconnect_interval = 5  # In seconds
-    connected = False
+    def __init__(
+        self,
+        *,
+        http_session: ClientSession | None = None,
+        reconnect_interval: float = 5.0,
+    ) -> None:
+        self.reconnect_interval = reconnect_interval
+        self._closing = False
+        self.connected = False
+        self.callbacks: set[MessageCallback] = set()
+        self.commandTopics: list[str] = []
+        self._client: Client | None = None
+        self._http_session = http_session
 
-    def __init__(self):
-        self.callbacks = []
+    def attach_http_session(self, session: ClientSession) -> None:
+        self._http_session = session
 
-    async def connect(self, get_credentials):
-        while True:
+    async def connect(self, get_credentials: CredentialProvider) -> None:
+        self._closing = False
+
+        while not self._closing:
             try:
                 credentials = await get_credentials()
 
@@ -36,76 +69,133 @@ class AlisteBroker:
 
                 urlparts = urlparse(ws_url)
 
-                # Host header needs to be set, port is not included in signed host header so should not be included here.
-                # No idea what it defaults to but whatever that it seems to be wrong.
+                # The signed Host header must match the websocket endpoint exactly.
                 headers = {
-                    "Host": "{0:s}".format(urlparts.netloc),
+                    "Host": f"{urlparts.netloc:s}",
                 }
                 async with Client(
                     hostname=urlparts.netloc,
                     port=443,
                     transport="websockets",
-                    websocket_path="{}?{}".format(urlparts.path, urlparts.query),
+                    websocket_path=f"{urlparts.path}?{urlparts.query}",
                     websocket_headers=headers,
                     tls_context=ssl.create_default_context(cafile=certifi.where()),
                 ) as client:
-                    self.client = client
+                    self._client = client
                     await self.on_connect()
 
                     async for message in client.messages:
+                        if self._closing:
+                            break
                         self.on_message(message)
-
+            except asyncio.CancelledError:
+                self.connected = False
+                self._client = None
+                raise
             except MqttError as error:
                 self.connected = False
-
-                print(
-                    f'Error "{error}". Reconnecting in {self.reconnect_interval} seconds.'
+                self._client = None
+                if self._closing:
+                    break
+                logger.warning(
+                    'MQTT error "%s". Reconnecting in %s seconds.',
+                    error,
+                    self.reconnect_interval,
                 )
-
                 await asyncio.sleep(self.reconnect_interval)
+            except Exception:
+                self.connected = False
+                self._client = None
+                if self._closing:
+                    break
+                logger.exception(
+                    "Unexpected broker failure. Reconnecting in %s seconds.",
+                    self.reconnect_interval,
+                )
+                await asyncio.sleep(self.reconnect_interval)
+            finally:
+                self.connected = False
+                self._client = None
 
-    def register_callback(self, callback):
-        self.callbacks.append(callback)
+    async def close(self) -> None:
+        self._closing = True
+        self.connected = False
+        client = self._client
+        if client is None:
+            return
 
-    def set_topics(self, topics: list[str]):
+        try:
+            await client.__aexit__(None, None, None)
+        except Exception:
+            logger.debug(
+                "Ignoring broker shutdown error during disconnect.",
+                exc_info=True,
+            )
+        finally:
+            self._client = None
+
+    def register_callback(self, callback: MessageCallback) -> None:
+        self.callbacks.add(callback)
+
+    def set_topics(self, topics: list[str]) -> None:
         self.commandTopics = topics
 
-    async def on_connect(self):
+    async def on_connect(self) -> None:
         self.connected = True
 
         for topic in self.commandTopics:
-            # print("Subscribing to topic: ", topic)
-            await self.client.subscribe(topic)
+            if self._client is None:
+                raise ApiError("Broker client is not available during subscription.")
+            await self._client.subscribe(topic)
 
-    def on_message(self, message: Message):
-        deviceId = message.topic.value.split("/")[1]
+    def on_message(self, message: Message) -> None:
+        topic = getattr(message.topic, "value", str(message.topic))
+        device_id = topic.split("/")[1]
         parsed = json.loads(message.payload.decode("utf-8"))
-        data = {
-            "deviceId": deviceId or 0,
-            "switchId": parsed["sid"] or 0,
-            "state": (parsed["s"] or 0) / 100,
+        data: BrokerMessage = {
+            "deviceId": device_id,
+            "switchId": int(parsed["sid"] or 0),
+            "state": float(parsed["s"] or 0) / 100,
         }
         for callback in self.callbacks:
             callback(data)
 
-    def message(self, data):
+    def message(self, data: BrokerMessage) -> None:
         for callback in self.callbacks:
             callback(data)
 
     @property
-    def is_connected(self):
+    def is_connected(self) -> bool:
         return self.connected
 
-    async def send_command(self, payload: dict):
-        if self.is_connected:
-            deviceId = payload["deviceId"]
-            switchId = payload["switchId"]
-            command = payload["command"]
-            await self.client.publish(
-                f"control/{deviceId}", f"{switchId},{command * 100}"
+    async def send_command(self, payload: CommandPayload) -> None:
+        if self.is_connected and self._client is not None:
+            device_id = payload["deviceId"]
+            switch_id = payload["switchId"]
+            command_value = int(payload["command"] * 100)
+            await self._client.publish(
+                f"control/{device_id}", f"{switch_id},{command_value}"
             )
-        else:
-            async with ClientSession() as session:
-                async with session.post(constants.commandUrl, json=payload):
-                    payload["state"] = payload["command"]
-                    self.message(payload)
+            return
+
+        if self._http_session is None:
+            raise ApiError(
+                "No HTTP session is attached to the broker for fallback command "
+                "delivery."
+            )
+
+        async with self._http_session.post(
+            constants.commandUrl, json=payload
+        ) as response:
+            if response.status >= 400:
+                raise ApiError(
+                    f"Command delivery failed with status {response.status}."
+                )
+
+        self.message(
+            {
+                "deviceId": payload["deviceId"],
+                "switchId": payload["switchId"],
+                "state": float(payload["command"]),
+            }
+        )

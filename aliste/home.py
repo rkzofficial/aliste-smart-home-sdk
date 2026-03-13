@@ -1,13 +1,18 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+
 from .device import Device
 
 
+@dataclass(slots=True)
 class Home:
-    def __init__(self, id: str, name: str, devices: list[Device]):
-        self.id = id
-        self.name = name
-        self.devices = devices
+    id: str
+    name: str
+    devices: list[Device]
 
-    def get_device(self, device_id: str):
+    def get_device(self, device_id: str) -> Device | None:
         for device in self.devices:
-            if device.id == device_id:
+            if device.deviceId == device_id:
                 return device
+        return None

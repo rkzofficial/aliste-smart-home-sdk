@@ -1,56 +1,95 @@
 import asyncio
 import json
+import logging
+from contextlib import suppress
+from typing import Any
 
 from aiohttp import ClientSession
-from .utils import parse_device_type
+
 from . import constants
-from .user import User
-from .device import Device
-from .home import Home
 from .broker import AlisteBroker
+from .device import Device
+from .errors import AlisteError, ApiError, AuthenticationError
+from .home import Home
+from .user import User
+from .utils import parse_device_type
+
+logger = logging.getLogger(__name__)
 
 
 class AlisteHub:
-    home: Home
-
-    def __init__(self):
-        self.background_tasks = set()
+    def __init__(self) -> None:
         self.broker = AlisteBroker()
-        self.http = ClientSession()
+        self.home: Home | None = None
+        self.http: ClientSession | None = None
+        self.user: User | None = None
+        self._broker_task: asyncio.Task[None] | None = None
+        self.username: str | None = None
+        self.password: str | None = None
 
-    async def __aenter__(self):
+    async def __aenter__(self) -> "AlisteHub":
         return self
 
-    async def __aexit__(self, *excinfo):
-        await self.http.close()
+    async def __aexit__(self, *excinfo: object) -> None:
+        await self.close()
 
-    async def init(self, username: str, password: str):
-        await self._authenticate(username, password)
-        await self.get_home_details()
-        await self._init_broker()
+    async def connect(self, username: str, password: str) -> None:
+        await self.close()
+        self.http = ClientSession()
+        self.broker = AlisteBroker(http_session=self.http)
+        try:
+            credentials = await self._authenticate_cognito()
+            await self._authenticate(username, password, credentials)
+            await self.get_home_details()
+            await self._init_broker()
+        except Exception:
+            await self.close()
+            raise
 
-    async def _init_broker(self):
+    async def close(self) -> None:
+        if self._broker_task is not None:
+            await self.broker.close()
+            try:
+                await asyncio.wait_for(self._broker_task, timeout=5)
+            except TimeoutError:
+                self._broker_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await self._broker_task
+            self._broker_task = None
+
+        if self.http is not None and not self.http.closed:
+            await self.http.close()
+        self.http = None
+
+    async def _init_broker(self) -> None:
+        if self.home is None:
+            raise AlisteError("Home details must be loaded before starting the broker.")
+
         topics_set = set()
 
         for device in self.home.devices:
             topics_set.add(f"message/{device.deviceId}")
 
-        self.broker.set_topics(list(topics_set))
-        loop = asyncio.get_event_loop()
-        # Listen for mqtt messages in an (unawaited) asyncio task
-        task = loop.create_task(self.broker.connect(self.get_credentials))
-        # Save a reference to the task so it doesn't get garbage collected
-        self.background_tasks.add(task)
-        task.add_done_callback(self.background_tasks.remove)
+        self.broker.set_topics(sorted(topics_set))
+        self._broker_task = asyncio.create_task(
+            self.broker.connect(self.get_credentials)
+        )
 
-    async def get_credentials(self):
+    async def get_credentials(self) -> dict[str, str]:
+        if self.user is None:
+            raise AuthenticationError("Authenticate before requesting credentials.")
+
         try:
-            await self._authenticate_cognito()
-        except:  # noqa: E722
-            print("Failed to fetch credentials")
+            self.user.credentials = await self._authenticate_cognito()
+        except AuthenticationError:
+            logger.exception("Failed to refresh Cognito credentials.")
+            raise
         return self.user.credentials
 
-    async def _authenticate_cognito(self):
+    async def _authenticate_cognito(self) -> dict[str, str]:
+        if self.http is None:
+            raise AlisteError("Hub is closed. Call connect() before using the SDK.")
+
         payload = {"IdentityId": constants.identityId}
 
         headers = {
@@ -63,52 +102,70 @@ class AlisteHub:
             "content-type": "application/x-amz-json-1.1",
         }
 
-        async with ClientSession() as session:
-            async with session.post(
-                constants.cognitoUrl, data=json.dumps(payload), headers=headers
-            ) as response:
-                if response.status != 200:
-                    raise Exception("Authentication failed")
+        async with self.http.post(
+            constants.cognitoUrl, data=json.dumps(payload), headers=headers
+        ) as response:
+            if response.status != 200:
+                raise AuthenticationError(
+                    f"Cognito credential exchange failed with status {response.status}."
+                )
 
-                data = await response.json(content_type=None)
-                credentials = data["Credentials"]
-                return credentials
+            data = await response.json(content_type=None)
+            credentials = data.get("Credentials")
+            if not isinstance(credentials, dict):
+                raise AuthenticationError(
+                    "Cognito response did not include credentials."
+                )
+            return {key: str(value) for key, value in credentials.items()}
 
-    async def _authenticate(self, mobile: str, password: str):
-        credentials = await self._authenticate_cognito()
+    async def _authenticate(
+        self, mobile: str, password: str, credentials: dict[str, str]
+    ) -> None:
+        if self.http is None:
+            raise AlisteError("Hub is closed. Call connect() before using the SDK.")
 
         payload = {
             "mobile": mobile,
             "password": password,
         }
 
-        async with ClientSession() as session:
-            async with session.post(constants.loginUrl, json=payload) as response:
-                if response.status == 200:
-                    json = await response.json()
-                    data = json["data"]
-                    self.user = User(
-                        accesstoken=data["accesstoken"],
-                        email=data["profile"]["email"],
-                        name=data["profile"]["name"],
-                        homeId=data["profile"]["selectedHouse"],
-                        mobile=data["profile"]["mobile"],
-                        credentials=credentials,
-                    )
-                    self.username = mobile
-                    self.password = password
-                else:
-                    raise Exception("Authentication failed")
+        async with self.http.post(constants.loginUrl, json=payload) as response:
+            if response.status != 200:
+                raise AuthenticationError(
+                    f"Aliste login failed with status {response.status}."
+                )
 
-    # Get home details
-    async def get_home_details(self):
-        response = await self.http.get(
+            payload_data = await response.json()
+            data = payload_data["data"]
+            profile = data["profile"]
+            self.user = User(
+                accesstoken=str(data["accesstoken"]),
+                email=str(profile["email"]),
+                name=str(profile["name"]),
+                homeId=str(profile["selectedHouse"]),
+                mobile=str(profile["mobile"]),
+                credentials=credentials,
+            )
+            self.username = mobile
+            self.password = password
+
+    async def get_home_details(self) -> Home:
+        if self.http is None or self.user is None:
+            raise AuthenticationError("Authenticate before requesting home details.")
+
+        async with self.http.get(
             f"{constants.homeDetailsUrl}/{self.user.homeId}/{self.user.mobile}"
-        )
-        resp = await response.json()
-        await self.process_home_details(resp)
+        ) as response:
+            if response.status != 200:
+                raise ApiError(
+                    f"Fetching home details failed with status {response.status}."
+                )
+            payload = await response.json()
 
-    async def process_home_details(self, json_data):
+        self.home = self.process_home_details(payload)
+        return self.home
+
+    def process_home_details(self, json_data: dict[str, Any]) -> Home:
         devices: list[Device] = []
 
         for room in json_data["rooms"]:
@@ -116,17 +173,15 @@ class AlisteHub:
                 for switch in device["switches"]:
                     item = Device(
                         deviceId=device["deviceId"],
-                        switchId=switch["switchId"],
+                        switchId=int(switch["switchId"]),
                         name=switch["switchName"],
                         type=parse_device_type(switch["deviceType"]),
-                        switchState=switch["switchState"],
+                        switchState=float(switch["switchState"]),
                         dimmable=switch["dimmable"],
-                        wattage=switch["wattage"],
+                        wattage=int(switch["wattage"]),
                         roomName=room["roomName"],
                         broker=self.broker,
                     )
                     devices.append(item)
 
-        self.home = Home(
-            id=json_data["_id"], name=json_data["houseName"], devices=devices
-        )
+        return Home(id=json_data["_id"], name=json_data["houseName"], devices=devices)

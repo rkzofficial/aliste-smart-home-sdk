@@ -1,5 +1,11 @@
-from .broker import AlisteBroker
+from __future__ import annotations
+
+from collections.abc import Callable
+
+from .broker import AlisteBroker, BrokerMessage, CommandPayload
 from .enums import DeviceType
+
+DeviceCallback = Callable[[], None]
 
 
 class Device:
@@ -14,7 +20,7 @@ class Device:
         wattage: int,
         roomName: str,
         broker: AlisteBroker,
-    ):
+    ) -> None:
         self.deviceId = deviceId
         self.switchId = switchId
         self.name = name
@@ -25,44 +31,46 @@ class Device:
         self.roomName = roomName
         self.broker = broker
 
-        self._callbacks = set()
+        self._callbacks: set[DeviceCallback] = set()
         self.broker.register_callback(self.on_message)
 
-    def on_message(self, message):
+    @property
+    def id(self) -> str:
+        return self.deviceId
+
+    def on_message(self, message: BrokerMessage) -> None:
         if (
             message["deviceId"] == self.deviceId
             and message["switchId"] == self.switchId
         ):
             self.on_state_change(message["state"])
 
-    def refresh(self):
+    def refresh(self) -> None:
         for callback in self._callbacks:
             callback()
 
-    def register_callback(self, callback) -> None:
-        """Register callback, called when Roller changes state."""
+    def register_callback(self, callback: DeviceCallback) -> None:
         self._callbacks.add(callback)
 
-    def remove_callback(self, callback) -> None:
-        """Remove previously registered callback."""
+    def remove_callback(self, callback: DeviceCallback) -> None:
         self._callbacks.discard(callback)
 
-    def on_state_change(self, state):
+    def on_state_change(self, state: float) -> None:
         self.switchState = float(state)
         self.refresh()
 
-    def build_command(self, command: float):
+    def build_command(self, command: float) -> CommandPayload:
         return {
             "deviceId": self.deviceId,
             "switchId": self.switchId,
             "command": command,
         }
 
-    async def turn_on(self):
+    async def turn_on(self) -> None:
         await self.broker.send_command(self.build_command(1))
 
-    async def turn_off(self):
+    async def turn_off(self) -> None:
         await self.broker.send_command(self.build_command(0))
 
-    async def dim(self, value: float):
+    async def dim(self, value: float) -> None:
         await self.broker.send_command(self.build_command(value))
