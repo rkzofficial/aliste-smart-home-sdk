@@ -194,20 +194,29 @@ class AlisteBroker:
                 "No HTTP session is attached to the broker for command delivery."
             )
 
+        # The control endpoint expects the command level on a 0-100 scale
+        # (100 = on, 0 = off), matching the mobile app; the SDK works with a
+        # normalised 0.0-1.0 value internally.
+        body = {
+            "deviceId": payload["deviceId"],
+            "switchId": payload["switchId"],
+            "command": int(round(payload["command"] * 100)),
+        }
         url = f"{constants.commandUrl}?user={self._command_user}"
-        headers = (
-            {"Authorization": f"Bearer {self._command_token}"}
-            if self._command_token
-            else {}
-        )
+        headers: dict[str, str] = {}
+        if self._command_token:
+            headers = {
+                "accesstoken": self._command_token,
+                "Authorization": f"Bearer {self._command_token}",
+            }
         async with self._http_session.post(
-            url, json=payload, headers=headers
+            url, json=body, headers=headers
         ) as response:
             if response.status >= 400:
-                body = await response.text()
+                text = await response.text()
                 raise ApiError(
                     f"Command delivery failed with status {response.status}: "
-                    f"{body[:200]}"
+                    f"{text[:200]}"
                 )
 
         self.message(
