@@ -9,6 +9,7 @@ from aiohttp import ClientSession
 from . import constants
 from .broker import AlisteBroker
 from .device import Device
+from .socket import AlisteSocket
 from .errors import AlisteError, ApiError, AuthenticationError
 from .home import Home
 from .user import User
@@ -30,6 +31,7 @@ def _normalise_level(value: Any) -> float:
 class AlisteHub:
     def __init__(self, poll_interval: float = 30.0) -> None:
         self.broker = AlisteBroker()
+        self.socket: AlisteSocket | None = None
         self.home: Home | None = None
         self.http: ClientSession | None = None
         self.user: User | None = None
@@ -61,12 +63,39 @@ class AlisteHub:
                 )
             await self.get_home_details()
             await self._init_broker()
+            await self._init_socket()
             self._poll_task = asyncio.create_task(self._poll_states())
         except Exception:
             await self.close()
             raise
 
+    async def _init_socket(self) -> None:
+        """Connect the realtime socket used by the app (best-effort)."""
+        if self.user is None:
+            return
+        socket = AlisteSocket()
+        socket.set_callbacks(self._on_socket_state, self.broker._emit_presence)
+        try:
+            await socket.connect(
+                self.user.homeId, self.user.email, self.user.name
+            )
+        except Exception:
+            logger.debug("Realtime socket unavailable; using REST", exc_info=True)
+            return
+        self.socket = socket
+        self.broker.set_socket(socket)
+
+    def _on_socket_state(self, device_id: str, switch_id: int, state: float) -> None:
+        self.broker.message(
+            {"deviceId": device_id, "switchId": switch_id, "state": state}
+        )
+
     async def close(self) -> None:
+        if self.socket is not None:
+            await self.socket.close()
+            self.socket = None
+            self.broker.set_socket(None)
+
         if self._poll_task is not None:
             self._poll_task.cancel()
             with suppress(asyncio.CancelledError):

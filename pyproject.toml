@@ -1,6 +1,6 @@
 [project]
 name = "aliste"
-version = "2.4.0"
+version = "2.5.0"
 description = "Async Python SDK for Aliste Smart Home devices."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -28,6 +28,7 @@ dependencies = [
     "aws-signv4-mqtt>=0.2.0,<0.3.0",
     "boto3>=1.42.67,<2.0.0",
     "certifi>=2026.2.25,<2027.0.0",
+    "python-socketio>=5.11.0,<6.0.0",
 ]
 
 [project.urls]

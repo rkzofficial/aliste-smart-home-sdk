@@ -53,9 +53,14 @@ class AlisteBroker:
         self._command_token: str = ""
         self._command_user: str = ""
         self._controller_id: str = "app"
+        self._socket: object | None = None
 
     def attach_http_session(self, session: ClientSession) -> None:
         self._http_session = session
+
+    def set_socket(self, socket: object | None) -> None:
+        """Attach the realtime socket used for control when available."""
+        self._socket = socket
 
     def set_command_auth(
         self, token: str, user: str, controller_id: str = "app"
@@ -302,6 +307,29 @@ class AlisteBroker:
         device_id = payload["deviceId"]
         switch_id = payload["switchId"]
         level = int(round(payload["command"] * 100))
+
+        # Prefer the app's realtime socket when the device is reachable there;
+        # otherwise use the authenticated REST control endpoint.
+        socket = self._socket
+        if socket is not None and getattr(socket, "connected", False) and (
+            socket.has_device(device_id)
+        ):
+            try:
+                await socket.send_command(device_id, switch_id, level)
+                self.message(
+                    {
+                        "deviceId": device_id,
+                        "switchId": switch_id,
+                        "state": float(payload["command"]),
+                    }
+                )
+                return
+            except Exception:
+                logger.debug(
+                    "Socket control failed for %s; falling back to REST",
+                    device_id,
+                    exc_info=True,
+                )
 
         url = f"{constants.commandUrl}?user={self._command_user}"
         headers: dict[str, str] = {}
