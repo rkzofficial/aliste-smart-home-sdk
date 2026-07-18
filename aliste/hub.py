@@ -17,6 +17,16 @@ from .utils import parse_device_type
 logger = logging.getLogger(__name__)
 
 
+def _normalise_level(value: Any) -> float:
+    """Return a switch level normalised to 0.0-1.0.
+
+    The cloud reports levels on a 0-100 scale; the SDK works with 0.0-1.0 to
+    match the live MQTT updates (which are divided by 100).
+    """
+    level = float(value)
+    return level / 100.0 if level > 1 else level
+
+
 class AlisteHub:
     def __init__(self) -> None:
         self.broker = AlisteBroker()
@@ -42,7 +52,9 @@ class AlisteHub:
             await self._authenticate(username, password, credentials)
             if self.user is not None:
                 self.broker.set_command_auth(
-                    self.user.accesstoken, self.user.userId or self.user.mobile
+                    self.user.accesstoken,
+                    self.user.userId or self.user.mobile,
+                    f"{self.user.name}({self.user.email})",
                 )
             await self.get_home_details()
             await self._init_broker()
@@ -69,12 +81,8 @@ class AlisteHub:
         if self.home is None:
             raise AlisteError("Home details must be loaded before starting the broker.")
 
-        topics_set = set()
-
-        for device in self.home.devices:
-            topics_set.add(f"message/{device.deviceId}")
-
-        self.broker.set_topics(sorted(topics_set))
+        device_ids = list(dict.fromkeys(d.deviceId for d in self.home.devices))
+        self.broker.set_devices(device_ids)
         self._broker_task = asyncio.create_task(
             self.broker.connect(self.get_credentials)
         )
@@ -190,7 +198,7 @@ class AlisteHub:
                         switchId=int(switch["switchId"]),
                         name=switch["switchName"],
                         type=parse_device_type(switch["deviceType"]),
-                        switchState=float(switch["switchState"]),
+                        switchState=_normalise_level(switch["switchState"]),
                         dimmable=switch["dimmable"],
                         wattage=int(switch["wattage"]),
                         roomName=room["roomName"],

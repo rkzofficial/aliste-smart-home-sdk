@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import ssl
+import time
 from collections.abc import Awaitable, Callable
 from typing import TypedDict
 from urllib.parse import urlparse
@@ -20,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 CredentialProvider = Callable[[], Awaitable[dict[str, str]]]
 MessageCallback = Callable[["BrokerMessage"], None]
+PresenceCallback = Callable[[str, bool], None]
 
 
 class BrokerMessage(TypedDict):
@@ -34,6 +36,11 @@ class CommandPayload(TypedDict):
     command: float
 
 
+def _command_id() -> str:
+    """Short id token the app attaches to each command (ms-timestamp tail)."""
+    return str(int(time.time() * 1000))[9:13]
+
+
 class AlisteBroker:
     def __init__(
         self,
@@ -45,19 +52,41 @@ class AlisteBroker:
         self._closing = False
         self.connected = False
         self.callbacks: set[MessageCallback] = set()
-        self.commandTopics: list[str] = []
+        self.presence_callbacks: set[PresenceCallback] = set()
+        self._device_ids: list[str] = []
         self._client: Client | None = None
         self._http_session = http_session
         self._command_token: str = ""
         self._command_user: str = ""
+        self._controller_id: str = "app"
 
     def attach_http_session(self, session: ClientSession) -> None:
         self._http_session = session
 
-    def set_command_auth(self, token: str, user: str) -> None:
-        """Provide the credentials used for authenticated REST commands."""
+    def set_command_auth(
+        self, token: str, user: str, controller_id: str = "app"
+    ) -> None:
+        """Provide the identity used for authenticated commands.
+
+        ``controller_id`` is the "name(email)" string the app tags commands with.
+        """
         self._command_token = token
         self._command_user = user
+        self._controller_id = controller_id or "app"
+
+    def set_devices(self, device_ids: list[str]) -> None:
+        """Register the devices whose status this broker should track."""
+        self._device_ids = list(dict.fromkeys(device_ids))
+
+    def _subscribe_topics(self) -> list[str]:
+        topics: list[str] = []
+        for device_id in self._device_ids:
+            topics.append(f"message/{device_id}")
+            topics.append(f"e/sync/{device_id}")
+            topics.append(f"e/conn/{device_id}")
+            topics.append(f"$aws/events/presence/connected/{device_id}")
+            topics.append(f"$aws/events/presence/disconnected/{device_id}")
+        return topics
 
     async def connect(self, get_credentials: CredentialProvider) -> None:
         self._closing = False
@@ -151,28 +180,109 @@ class AlisteBroker:
     def register_callback(self, callback: MessageCallback) -> None:
         self.callbacks.add(callback)
 
-    def set_topics(self, topics: list[str]) -> None:
-        self.commandTopics = topics
+    def register_presence_callback(self, callback: PresenceCallback) -> None:
+        self.presence_callbacks.add(callback)
 
     async def on_connect(self) -> None:
         self.connected = True
 
-        for topic in self.commandTopics:
-            if self._client is None:
-                raise ApiError("Broker client is not available during subscription.")
+        if self._client is None:
+            raise ApiError("Broker client is not available during subscription.")
+
+        for topic in self._subscribe_topics():
             await self._client.subscribe(topic)
+
+        # Ask every device to report its current state now that we are listening.
+        await self.request_status()
+
+    async def request_status(self, device_ids: list[str] | None = None) -> None:
+        """Publish an empty message to ``status/{deviceId}`` to pull live state."""
+        if self._client is None or not self.connected:
+            return
+        for device_id in device_ids or self._device_ids:
+            try:
+                await self._client.publish(f"status/{device_id}", "{}")
+            except MqttError:
+                logger.debug("Failed to request status for %s", device_id)
 
     def on_message(self, message: Message) -> None:
         topic = getattr(message.topic, "value", str(message.topic))
-        device_id = topic.split("/")[1]
-        parsed = json.loads(message.payload.decode("utf-8"))
+        try:
+            self._dispatch(topic, message.payload)
+        except Exception:
+            logger.debug("Failed to handle message on %s", topic, exc_info=True)
+
+    def _dispatch(self, topic: str, raw: bytes | bytearray | str | None) -> None:
+        # Presence events: $aws/events/presence/{connected|disconnected}/{deviceId}
+        if topic.startswith("$aws"):
+            parts = topic.split("/")
+            state, device_id = parts[-2], parts[-1]
+            self._emit_presence(device_id, state == "connected")
+            return
+
+        payload = self._decode(raw)
+
+        # Strip the "e/" prefix used for sync/conn topics.
+        normalized = topic[2:] if topic.startswith("e/") else topic
+        parts = normalized.split("/")
+        kind, device_id = parts[0], (parts[1] if len(parts) > 1 else "")
+
+        if kind == "message":
+            if isinstance(payload, dict):
+                self._emit_state(
+                    device_id, payload.get("sid"), payload.get("s")
+                )
+        elif kind in ("sync", "conn"):
+            if isinstance(payload, dict):
+                self._emit_sync(device_id, payload.get("ls"))
+
+    @staticmethod
+    def _decode(raw: bytes | bytearray | str | None) -> object:
+        if raw is None:
+            return None
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode("utf-8")
+        raw = raw.strip()
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except (ValueError, TypeError):
+            return None
+
+    def _emit_state(self, device_id: str, sid: object, s: object) -> None:
+        if sid is None or s is None:
+            return
         data: BrokerMessage = {
             "deviceId": device_id,
-            "switchId": int(parsed["sid"] or 0),
-            "state": float(parsed["s"] or 0) / 100,
+            "switchId": int(sid),
+            "state": float(s) / 100.0,
         }
         for callback in self.callbacks:
             callback(data)
+
+    def _emit_sync(self, device_id: str, ls: object) -> None:
+        """Handle a bulk state list from a sync/conn message.
+
+        ``ls`` entries may be dicts ({sid, s} / {switchId, switchState}) or a
+        positional array of levels indexed from switch 1.
+        """
+        if not isinstance(ls, list):
+            return
+        for index, entry in enumerate(ls):
+            if isinstance(entry, dict):
+                sid = entry.get("sid", entry.get("switchId"))
+                level = entry.get("s", entry.get("switchState"))
+            else:
+                sid = index + 1
+                level = entry
+            if sid is None or level is None:
+                continue
+            self._emit_state(device_id, sid, level)
+
+    def _emit_presence(self, device_id: str, online: bool) -> None:
+        for callback in self.presence_callbacks:
+            callback(device_id, online)
 
     def message(self, data: BrokerMessage) -> None:
         for callback in self.callbacks:
@@ -183,25 +293,57 @@ class AlisteBroker:
         return self.connected
 
     async def send_command(self, payload: CommandPayload) -> None:
-        """Deliver an on/off/dim command via the authenticated control endpoint.
+        """Send an on/off/dim command using the app's control mechanism.
 
-        Commands are delivered over HTTP to ``/v3/device/control`` (the same
-        mechanism the mobile app uses). MQTT is used only for receiving status
-        updates, not for issuing commands.
+        For MQTT-connected devices the app publishes to both ``control/{id}``
+        (a comma-separated string) and ``command/{id}`` (a JSON object). When the
+        MQTT link is down we fall back to the authenticated REST control
+        endpoint. Commands use a 0-100 level scale (100 = on); the SDK works with
+        a normalised 0.0-1.0 value internally.
         """
+        device_id = payload["deviceId"]
+        switch_id = payload["switchId"]
+        level = int(round(payload["command"] * 100))
+
+        if self.is_connected and self._client is not None:
+            command_id = _command_id()
+            await self._client.publish(
+                f"control/{device_id}", f"{switch_id},{level},{command_id}"
+            )
+            await self._client.publish(
+                f"command/{device_id}",
+                json.dumps(
+                    {
+                        "deviceId": device_id,
+                        "switchId": switch_id,
+                        "command": level,
+                        "id": command_id,
+                        "controllerType": "app",
+                        "controllerId": self._controller_id,
+                        "controllerDetails": "{}",
+                    }
+                ),
+            )
+        else:
+            await self._send_rest_command(device_id, switch_id, level)
+
+        # Reflect the requested state immediately; the device echoes the real
+        # value back over MQTT shortly after.
+        self.message(
+            {
+                "deviceId": device_id,
+                "switchId": switch_id,
+                "state": float(payload["command"]),
+            }
+        )
+
+    async def _send_rest_command(
+        self, device_id: str, switch_id: int, level: int
+    ) -> None:
         if self._http_session is None:
             raise ApiError(
                 "No HTTP session is attached to the broker for command delivery."
             )
-
-        # The control endpoint expects the command level on a 0-100 scale
-        # (100 = on, 0 = off), matching the mobile app; the SDK works with a
-        # normalised 0.0-1.0 value internally.
-        body = {
-            "deviceId": payload["deviceId"],
-            "switchId": payload["switchId"],
-            "command": int(round(payload["command"] * 100)),
-        }
         url = f"{constants.commandUrl}?user={self._command_user}"
         headers: dict[str, str] = {}
         if self._command_token:
@@ -209,6 +351,7 @@ class AlisteBroker:
                 "accesstoken": self._command_token,
                 "Authorization": f"Bearer {self._command_token}",
             }
+        body = {"deviceId": device_id, "switchId": switch_id, "command": level}
         async with self._http_session.post(
             url, json=body, headers=headers
         ) as response:
@@ -218,11 +361,3 @@ class AlisteBroker:
                     f"Command delivery failed with status {response.status}: "
                     f"{text[:200]}"
                 )
-
-        self.message(
-            {
-                "deviceId": payload["deviceId"],
-                "switchId": payload["switchId"],
-                "state": float(payload["command"]),
-            }
-        )

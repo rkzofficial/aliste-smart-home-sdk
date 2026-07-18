@@ -30,20 +30,38 @@ class Device:
         self.wattage = wattage
         self.roomName = roomName
         self.broker = broker
+        self.online = True
 
         self._callbacks: set[DeviceCallback] = set()
         self.broker.register_callback(self.on_message)
+        self.broker.register_presence_callback(self.on_presence)
 
     @property
     def id(self) -> str:
         return self.deviceId
+
+    @property
+    def available(self) -> bool:
+        """Whether the physical device is currently reachable (MQTT present)."""
+        return self.online
+
+    @property
+    def is_on(self) -> bool:
+        return self.switchState > 0
 
     def on_message(self, message: BrokerMessage) -> None:
         if (
             message["deviceId"] == self.deviceId
             and message["switchId"] == self.switchId
         ):
+            # Any status message implies the device is reachable.
+            self.online = True
             self.on_state_change(message["state"])
+
+    def on_presence(self, device_id: str, online: bool) -> None:
+        if device_id == self.deviceId:
+            self.online = online
+            self.refresh()
 
     def refresh(self) -> None:
         for callback in self._callbacks:
@@ -74,3 +92,7 @@ class Device:
 
     async def dim(self, value: float) -> None:
         await self.broker.send_command(self.build_command(value))
+
+    async def refresh_state(self) -> None:
+        """Request the device's current state from the cloud/broker."""
+        await self.broker.request_status([self.deviceId])
