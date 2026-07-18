@@ -4,7 +4,6 @@ import asyncio
 import json
 import logging
 import ssl
-import time
 from collections.abc import Awaitable, Callable
 from typing import TypedDict
 from urllib.parse import urlparse
@@ -34,11 +33,6 @@ class CommandPayload(TypedDict):
     deviceId: str
     switchId: int
     command: float
-
-
-def _command_id() -> str:
-    """Short id token the app attaches to each command (ms-timestamp tail)."""
-    return str(int(time.time() * 1000))[9:13]
 
 
 class AlisteBroker:
@@ -264,21 +258,20 @@ class AlisteBroker:
     def _emit_sync(self, device_id: str, ls: object) -> None:
         """Handle a bulk state list from a sync/conn message.
 
-        ``ls`` entries may be dicts ({sid, s} / {switchId, switchState}) or a
-        positional array of levels indexed from switch 1.
+        ``ls`` is a comma-separated string of levels indexed by switchId, e.g.
+        ``"0,100,0,100"`` → switch 0 = 0, switch 1 = 100, … (matching the app's
+        ``ls.split(',')[switchId]``). A list is also tolerated defensively.
         """
-        if not isinstance(ls, list):
+        if isinstance(ls, str):
+            values: list[object] = [v for v in ls.split(",")]
+        elif isinstance(ls, list):
+            values = ls
+        else:
             return
-        for index, entry in enumerate(ls):
-            if isinstance(entry, dict):
-                sid = entry.get("sid", entry.get("switchId"))
-                level = entry.get("s", entry.get("switchState"))
-            else:
-                sid = index + 1
-                level = entry
-            if sid is None or level is None:
+        for switch_id, level in enumerate(values):
+            if level is None or level == "":
                 continue
-            self._emit_state(device_id, sid, level)
+            self._emit_state(device_id, switch_id, level)
 
     def _emit_presence(self, device_id: str, online: bool) -> None:
         for callback in self.presence_callbacks:
@@ -293,39 +286,47 @@ class AlisteBroker:
         return self.connected
 
     async def send_command(self, payload: CommandPayload) -> None:
-        """Send an on/off/dim command using the app's control mechanism.
+        """Send an on/off/dim command via the authenticated control endpoint.
 
-        For MQTT-connected devices the app publishes to both ``control/{id}``
-        (a comma-separated string) and ``command/{id}`` (a JSON object). When the
-        MQTT link is down we fall back to the authenticated REST control
-        endpoint. Commands use a 0-100 level scale (100 = on); the SDK works with
-        a normalised 0.0-1.0 value internally.
+        Verified against a live device: the app's ``POST /v3/device/control``
+        with the full body (``controllerType``/``controllerId``/
+        ``controllerDetails``) and the ``accesstoken`` header actuates the
+        device. Commands use a 0-100 level scale (100 = on); the SDK works with a
+        normalised 0.0-1.0 value internally.
         """
+        if self._http_session is None:
+            raise ApiError(
+                "No HTTP session is attached to the broker for command delivery."
+            )
+
         device_id = payload["deviceId"]
         switch_id = payload["switchId"]
         level = int(round(payload["command"] * 100))
 
-        if self.is_connected and self._client is not None:
-            command_id = _command_id()
-            await self._client.publish(
-                f"control/{device_id}", f"{switch_id},{level},{command_id}"
-            )
-            await self._client.publish(
-                f"command/{device_id}",
-                json.dumps(
-                    {
-                        "deviceId": device_id,
-                        "switchId": switch_id,
-                        "command": level,
-                        "id": command_id,
-                        "controllerType": "app",
-                        "controllerId": self._controller_id,
-                        "controllerDetails": "{}",
-                    }
-                ),
-            )
-        else:
-            await self._send_rest_command(device_id, switch_id, level)
+        url = f"{constants.commandUrl}?user={self._command_user}"
+        headers: dict[str, str] = {}
+        if self._command_token:
+            headers = {
+                "accesstoken": self._command_token,
+                "Authorization": f"Bearer {self._command_token}",
+            }
+        body = {
+            "deviceId": device_id,
+            "switchId": switch_id,
+            "command": level,
+            "controllerType": "app",
+            "controllerId": self._controller_id,
+            "controllerDetails": {},
+        }
+        async with self._http_session.post(
+            url, json=body, headers=headers
+        ) as response:
+            if response.status >= 400:
+                text = await response.text()
+                raise ApiError(
+                    f"Command delivery failed with status {response.status}: "
+                    f"{text[:200]}"
+                )
 
         # Reflect the requested state immediately; the device echoes the real
         # value back over MQTT shortly after.
@@ -336,28 +337,3 @@ class AlisteBroker:
                 "state": float(payload["command"]),
             }
         )
-
-    async def _send_rest_command(
-        self, device_id: str, switch_id: int, level: int
-    ) -> None:
-        if self._http_session is None:
-            raise ApiError(
-                "No HTTP session is attached to the broker for command delivery."
-            )
-        url = f"{constants.commandUrl}?user={self._command_user}"
-        headers: dict[str, str] = {}
-        if self._command_token:
-            headers = {
-                "accesstoken": self._command_token,
-                "Authorization": f"Bearer {self._command_token}",
-            }
-        body = {"deviceId": device_id, "switchId": switch_id, "command": level}
-        async with self._http_session.post(
-            url, json=body, headers=headers
-        ) as response:
-            if response.status >= 400:
-                text = await response.text()
-                raise ApiError(
-                    f"Command delivery failed with status {response.status}: "
-                    f"{text[:200]}"
-                )
