@@ -40,6 +40,10 @@ class AlisteHub:
         try:
             credentials = await self._authenticate_cognito()
             await self._authenticate(username, password, credentials)
+            if self.user is not None:
+                self.broker.set_command_auth(
+                    self.user.accesstoken, self.user.userId or self.user.mobile
+                )
             await self.get_home_details()
             await self._init_broker()
         except Exception:
@@ -138,6 +142,15 @@ class AlisteHub:
             payload_data = await response.json()
             data = payload_data["data"]
             profile = data["profile"]
+            # The control endpoint is scoped by the account's user id (?user=),
+            # which is the profile's Mongo _id; fall back to the mobile number.
+            user_id = (
+                profile.get("_id")
+                or data.get("_id")
+                or profile.get("userId")
+                or data.get("userId")
+                or str(profile["mobile"])
+            )
             self.user = User(
                 accesstoken=str(data["accesstoken"]),
                 email=str(profile["email"]),
@@ -145,6 +158,7 @@ class AlisteHub:
                 homeId=str(profile["selectedHouse"]),
                 mobile=str(profile["mobile"]),
                 credentials=credentials,
+                userId=str(user_id),
             )
             self.username = mobile
             self.password = password
