@@ -40,6 +40,10 @@ class AlisteHub:
         try:
             credentials = await self._authenticate_cognito()
             await self._authenticate(username, password, credentials)
+            if self.user is not None:
+                self.broker.set_command_auth(
+                    self.user.accesstoken, self.user.userId or self.user.mobile
+                )
             await self.get_home_details()
             await self._init_broker()
         except Exception:
@@ -138,6 +142,20 @@ class AlisteHub:
             payload_data = await response.json()
             data = payload_data["data"]
             profile = data["profile"]
+            # Diagnostic: surface the response shape so we can identify the
+            # correct user identifier expected by the command endpoint.
+            logger.warning(
+                "ALISTE-DBG login data keys=%s profile keys=%s _id=%r userId=%r",
+                sorted(data.keys()), sorted(profile.keys()),
+                profile.get("_id"), profile.get("userId") or data.get("userId"),
+            )
+            user_id = (
+                profile.get("_id")
+                or data.get("_id")
+                or profile.get("userId")
+                or data.get("userId")
+                or str(profile["mobile"])
+            )
             self.user = User(
                 accesstoken=str(data["accesstoken"]),
                 email=str(profile["email"]),
@@ -145,6 +163,7 @@ class AlisteHub:
                 homeId=str(profile["selectedHouse"]),
                 mobile=str(profile["mobile"]),
                 credentials=credentials,
+                userId=str(user_id),
             )
             self.username = mobile
             self.password = password
@@ -170,6 +189,14 @@ class AlisteHub:
 
         for room in json_data["rooms"]:
             for device in room["devices"]:
+                # Diagnostic: dump the raw device shape (keys + a sample) so we
+                # can see gateway/mac fields the command endpoint may require.
+                if str(device.get("deviceId", "")).startswith("S0308"):
+                    logger.warning(
+                        "ALISTE-DBG device keys=%s device=%s",
+                        sorted(device.keys()),
+                        {k: v for k, v in device.items() if k != "switches"},
+                    )
                 for switch in device["switches"]:
                     item = Device(
                         deviceId=device["deviceId"],

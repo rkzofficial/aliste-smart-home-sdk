@@ -11,3 +11,4 @@ class User:
     homeId: str
     mobile: str
     credentials: dict[str, str]
+    userId: str = ""

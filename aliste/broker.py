@@ -48,9 +48,16 @@ class AlisteBroker:
         self.commandTopics: list[str] = []
         self._client: Client | None = None
         self._http_session = http_session
+        self._command_token: str = ""
+        self._command_user: str = ""
 
     def attach_http_session(self, session: ClientSession) -> None:
         self._http_session = session
+
+    def set_command_auth(self, token: str, user: str) -> None:
+        """Provide the credentials used for authenticated REST commands."""
+        self._command_token = token
+        self._command_user = user
 
     async def connect(self, get_credentials: CredentialProvider) -> None:
         self._closing = False
@@ -73,13 +80,20 @@ class AlisteBroker:
                 headers = {
                     "Host": f"{urlparts.netloc:s}",
                 }
+                # Building the SSL context reads the CA bundle from disk, which is
+                # blocking; run it in the default executor to avoid stalling the
+                # event loop (HA flags this as a blocking call otherwise).
+                loop = asyncio.get_running_loop()
+                tls_context = await loop.run_in_executor(
+                    None, lambda: ssl.create_default_context(cafile=certifi.where())
+                )
                 async with Client(
                     hostname=urlparts.netloc,
                     port=443,
                     transport="websockets",
                     websocket_path=f"{urlparts.path}?{urlparts.query}",
                     websocket_headers=headers,
-                    tls_context=ssl.create_default_context(cafile=certifi.where()),
+                    tls_context=tls_context,
                 ) as client:
                     self._client = client
                     await self.on_connect()
@@ -169,28 +183,48 @@ class AlisteBroker:
         return self.connected
 
     async def send_command(self, payload: CommandPayload) -> None:
+        device_id = payload["deviceId"]
+        switch_id = payload["switchId"]
+        command_value = int(payload["command"] * 100)
+
+        # Publish over MQTT when connected (keeps realtime status flowing).
         if self.is_connected and self._client is not None:
-            device_id = payload["deviceId"]
-            switch_id = payload["switchId"]
-            command_value = int(payload["command"] * 100)
+            logger.warning(
+                "ALISTE-DBG publish MQTT control/%s -> %s,%s",
+                device_id, switch_id, command_value,
+            )
             await self._client.publish(
                 f"control/{device_id}", f"{switch_id},{command_value}"
             )
-            return
 
+        # Authenticated REST command (the mechanism the mobile app uses).
+        await self._send_rest_command(payload)
+
+    async def _send_rest_command(self, payload: CommandPayload) -> None:
         if self._http_session is None:
             raise ApiError(
-                "No HTTP session is attached to the broker for fallback command "
-                "delivery."
+                "No HTTP session is attached to the broker for command delivery."
             )
 
-        async with self._http_session.post(
-            constants.commandUrl, json=payload
-        ) as response:
-            if response.status >= 400:
-                raise ApiError(
-                    f"Command delivery failed with status {response.status}."
+        url = f"{constants.commandUrl}?user={self._command_user}"
+        headers = {"Authorization": f"Bearer {self._command_token}"}
+        logger.warning(
+            "ALISTE-DBG REST POST %s body=%s user=%r token_len=%d",
+            constants.commandUrl, dict(payload), self._command_user,
+            len(self._command_token),
+        )
+        try:
+            async with self._http_session.post(
+                url, json=payload, headers=headers
+            ) as response:
+                body = await response.text()
+                logger.warning(
+                    "ALISTE-DBG REST resp status=%s body=%s",
+                    response.status, body[:400],
                 )
+        except Exception:
+            logger.exception("ALISTE-DBG REST command failed")
+            return
 
         self.message(
             {
