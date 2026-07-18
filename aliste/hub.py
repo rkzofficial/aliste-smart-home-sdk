@@ -28,12 +28,15 @@ def _normalise_level(value: Any) -> float:
 
 
 class AlisteHub:
-    def __init__(self) -> None:
+    def __init__(self, poll_interval: float = 30.0) -> None:
         self.broker = AlisteBroker()
         self.home: Home | None = None
         self.http: ClientSession | None = None
         self.user: User | None = None
         self._broker_task: asyncio.Task[None] | None = None
+        self._poll_task: asyncio.Task[None] | None = None
+        self._poll_interval = poll_interval
+        self._devices_by_key: dict[tuple[str, int], Device] = {}
         self.username: str | None = None
         self.password: str | None = None
 
@@ -58,11 +61,18 @@ class AlisteHub:
                 )
             await self.get_home_details()
             await self._init_broker()
+            self._poll_task = asyncio.create_task(self._poll_states())
         except Exception:
             await self.close()
             raise
 
     async def close(self) -> None:
+        if self._poll_task is not None:
+            self._poll_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._poll_task
+            self._poll_task = None
+
         if self._broker_task is not None:
             await self.broker.close()
             try:
@@ -86,6 +96,37 @@ class AlisteHub:
         self._broker_task = asyncio.create_task(
             self.broker.connect(self.get_credentials)
         )
+
+    async def _poll_states(self) -> None:
+        """Periodically refresh device states from the cloud.
+
+        MQTT/socket status delivery is not guaranteed for every change source
+        (physical switch, official app, other cloud actions), so poll the house
+        snapshot as a reliable source of truth and push any diffs to entities.
+        """
+        while True:
+            await asyncio.sleep(self._poll_interval)
+            try:
+                payload = await self._fetch_home_payload()
+                self._apply_states(payload)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug("State poll failed", exc_info=True)
+
+    def _apply_states(self, json_data: dict[str, Any]) -> None:
+        """Update existing Device objects from a fresh house payload."""
+        for room in json_data.get("rooms", []):
+            for device in room.get("devices", []):
+                device_id = device.get("deviceId")
+                for switch in device.get("switches", []):
+                    key = (device_id, int(switch["switchId"]))
+                    dev = self._devices_by_key.get(key)
+                    if dev is None:
+                        continue
+                    level = _normalise_level(switch["switchState"])
+                    if level != dev.switchState:
+                        dev.on_state_change(level)
 
     async def get_credentials(self) -> dict[str, str]:
         if self.user is None:
@@ -171,7 +212,7 @@ class AlisteHub:
             self.username = mobile
             self.password = password
 
-    async def get_home_details(self) -> Home:
+    async def _fetch_home_payload(self) -> dict[str, Any]:
         if self.http is None or self.user is None:
             raise AuthenticationError("Authenticate before requesting home details.")
 
@@ -182,13 +223,16 @@ class AlisteHub:
                 raise ApiError(
                     f"Fetching home details failed with status {response.status}."
                 )
-            payload = await response.json()
+            return await response.json()
 
+    async def get_home_details(self) -> Home:
+        payload = await self._fetch_home_payload()
         self.home = self.process_home_details(payload)
         return self.home
 
     def process_home_details(self, json_data: dict[str, Any]) -> Home:
         devices: list[Device] = []
+        self._devices_by_key = {}
 
         for room in json_data["rooms"]:
             for device in room["devices"]:
@@ -205,5 +249,6 @@ class AlisteHub:
                         broker=self.broker,
                     )
                     devices.append(item)
+                    self._devices_by_key[(item.deviceId, item.switchId)] = item
 
         return Home(id=json_data["_id"], name=json_data["houseName"], devices=devices)

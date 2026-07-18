@@ -1,6 +1,6 @@
 [project]
 name = "aliste"
-version = "2.3.0"
+version = "2.4.0"
 description = "Async Python SDK for Aliste Smart Home devices."
 readme = "README.md"
 requires-python = ">=3.11"
