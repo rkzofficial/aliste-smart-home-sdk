@@ -183,48 +183,32 @@ class AlisteBroker:
         return self.connected
 
     async def send_command(self, payload: CommandPayload) -> None:
-        device_id = payload["deviceId"]
-        switch_id = payload["switchId"]
-        command_value = int(payload["command"] * 100)
+        """Deliver an on/off/dim command via the authenticated control endpoint.
 
-        # Publish over MQTT when connected (keeps realtime status flowing).
-        if self.is_connected and self._client is not None:
-            logger.warning(
-                "ALISTE-DBG publish MQTT control/%s -> %s,%s",
-                device_id, switch_id, command_value,
-            )
-            await self._client.publish(
-                f"control/{device_id}", f"{switch_id},{command_value}"
-            )
-
-        # Authenticated REST command (the mechanism the mobile app uses).
-        await self._send_rest_command(payload)
-
-    async def _send_rest_command(self, payload: CommandPayload) -> None:
+        Commands are delivered over HTTP to ``/v3/device/control`` (the same
+        mechanism the mobile app uses). MQTT is used only for receiving status
+        updates, not for issuing commands.
+        """
         if self._http_session is None:
             raise ApiError(
                 "No HTTP session is attached to the broker for command delivery."
             )
 
         url = f"{constants.commandUrl}?user={self._command_user}"
-        headers = {"Authorization": f"Bearer {self._command_token}"}
-        logger.warning(
-            "ALISTE-DBG REST POST %s body=%s user=%r token_len=%d",
-            constants.commandUrl, dict(payload), self._command_user,
-            len(self._command_token),
+        headers = (
+            {"Authorization": f"Bearer {self._command_token}"}
+            if self._command_token
+            else {}
         )
-        try:
-            async with self._http_session.post(
-                url, json=payload, headers=headers
-            ) as response:
+        async with self._http_session.post(
+            url, json=payload, headers=headers
+        ) as response:
+            if response.status >= 400:
                 body = await response.text()
-                logger.warning(
-                    "ALISTE-DBG REST resp status=%s body=%s",
-                    response.status, body[:400],
+                raise ApiError(
+                    f"Command delivery failed with status {response.status}: "
+                    f"{body[:200]}"
                 )
-        except Exception:
-            logger.exception("ALISTE-DBG REST command failed")
-            return
 
         self.message(
             {

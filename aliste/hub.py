@@ -142,13 +142,8 @@ class AlisteHub:
             payload_data = await response.json()
             data = payload_data["data"]
             profile = data["profile"]
-            # Diagnostic: surface the response shape so we can identify the
-            # correct user identifier expected by the command endpoint.
-            logger.warning(
-                "ALISTE-DBG login data keys=%s profile keys=%s _id=%r userId=%r",
-                sorted(data.keys()), sorted(profile.keys()),
-                profile.get("_id"), profile.get("userId") or data.get("userId"),
-            )
+            # The control endpoint is scoped by the account's user id (?user=),
+            # which is the profile's Mongo _id; fall back to the mobile number.
             user_id = (
                 profile.get("_id")
                 or data.get("_id")
@@ -189,14 +184,6 @@ class AlisteHub:
 
         for room in json_data["rooms"]:
             for device in room["devices"]:
-                # Diagnostic: dump the raw device shape (keys + a sample) so we
-                # can see gateway/mac fields the command endpoint may require.
-                if str(device.get("deviceId", "")).startswith("S0308"):
-                    logger.warning(
-                        "ALISTE-DBG device keys=%s device=%s",
-                        sorted(device.keys()),
-                        {k: v for k, v in device.items() if k != "switches"},
-                    )
                 for switch in device["switches"]:
                     item = Device(
                         deviceId=device["deviceId"],
