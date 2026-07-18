@@ -308,29 +308,8 @@ class AlisteBroker:
         switch_id = payload["switchId"]
         level = int(round(payload["command"] * 100))
 
-        # Prefer the app's realtime socket when the device is reachable there;
-        # otherwise use the authenticated REST control endpoint.
-        socket = self._socket
-        if socket is not None and getattr(socket, "connected", False) and (
-            socket.has_device(device_id)
-        ):
-            try:
-                await socket.send_command(device_id, switch_id, level)
-                self.message(
-                    {
-                        "deviceId": device_id,
-                        "switchId": switch_id,
-                        "state": float(payload["command"]),
-                    }
-                )
-                return
-            except Exception:
-                logger.debug(
-                    "Socket control failed for %s; falling back to REST",
-                    device_id,
-                    exc_info=True,
-                )
-
+        # Control goes over the authenticated REST endpoint (the proven-reliable
+        # path). The realtime socket is used only as a status source.
         url = f"{constants.commandUrl}?user={self._command_user}"
         headers: dict[str, str] = {}
         if self._command_token:
